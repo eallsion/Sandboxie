@@ -401,17 +401,48 @@ _FX ULONG File_GetPathFlags(const WCHAR* Path, WCHAR** pRelocation)
 
 
 //---------------------------------------------------------------------------
+// File_AppendPathEntry_internal
+//---------------------------------------------------------------------------
+
+
+_FX VOID File_AppendPathEntry_internal(HANDLE hPathsFile, const WCHAR* Path, ULONG SetFlags, const WCHAR* Relocation, WCHAR* (*TranslatePath)(const WCHAR*))
+{
+    const WCHAR CrLf[] = L"\r\n";
+    WCHAR FlagStr[16] = L"|";
+
+    IO_STATUS_BLOCK IoStatusBlock;
+
+    // write the path
+    WCHAR* PathEx = TranslatePath ? TranslatePath(Path) : NULL;
+    NtWriteFile(hPathsFile, NULL, NULL, NULL, &IoStatusBlock, PathEx ? PathEx : Path, wcslen(PathEx ? PathEx : Path) * sizeof(WCHAR), NULL, NULL);
+    if (PathEx) Dll_Free(PathEx);
+
+    // write the flags
+    _ultow(SetFlags, FlagStr + 1, 16);
+    NtWriteFile(hPathsFile, NULL, NULL, NULL, &IoStatusBlock, FlagStr, wcslen(FlagStr) * sizeof(WCHAR), NULL, NULL);
+
+    // write the relocation
+    if (Relocation != NULL) {
+
+        NtWriteFile(hPathsFile, NULL, NULL, NULL, &IoStatusBlock, FlagStr, sizeof(WCHAR), NULL, NULL); // write |
+
+        WCHAR* RelocationEx = TranslatePath ? TranslatePath(Relocation) : NULL;
+        NtWriteFile(hPathsFile, NULL, NULL, NULL, &IoStatusBlock, RelocationEx ? RelocationEx : Relocation, wcslen(RelocationEx ? RelocationEx : Relocation) * sizeof(WCHAR), NULL, NULL);
+        if (RelocationEx) Dll_Free(RelocationEx);
+    }
+
+    // write line ending
+    NtWriteFile(hPathsFile, NULL, NULL, NULL, &IoStatusBlock, (void*)CrLf, sizeof(CrLf) - sizeof(WCHAR), NULL, NULL);
+}
+
+
+//---------------------------------------------------------------------------
 // File_SavePathNode_internal
 //---------------------------------------------------------------------------
 
 
 _FX VOID File_SavePathNode_internal(HANDLE hPathsFile, LIST* parent, WCHAR* Path, ULONG Length, ULONG SetFlags, WCHAR* (*TranslatePath)(const WCHAR *)) 
 {
-    IO_STATUS_BLOCK IoStatusBlock;
-
-    const WCHAR CrLf[] = L"\r\n";
-    WCHAR FlagStr[16] = L"|";
-
     // append  L"\\"
     Path[Length++] = L'\\'; //Path[Length] = L'0';
     WCHAR* PathBase = Path + Length;
@@ -431,30 +462,8 @@ _FX VOID File_SavePathNode_internal(HANDLE hPathsFile, LIST* parent, WCHAR* Path
         if ((child->flags & FILE_RELOCATION_FLAG) != 0)
             SetFlags = 0;
 
-        if ((child->flags & ~SetFlags) != 0 || child->relocation != NULL) { 
-
-            // write the path
-            WCHAR* PathEx = TranslatePath ? TranslatePath(Path) : NULL;
-            NtWriteFile(hPathsFile, NULL, NULL, NULL, &IoStatusBlock, PathEx ? PathEx : Path, wcslen(PathEx ? PathEx : Path) * sizeof(WCHAR), NULL, NULL);
-            if (PathEx) Dll_Free(PathEx);
-
-            // write the flags
-            _ultow(child->flags, FlagStr + 1, 16);
-            NtWriteFile(hPathsFile, NULL, NULL, NULL, &IoStatusBlock, FlagStr, wcslen(FlagStr) * sizeof(WCHAR), NULL, NULL);
-
-            // write the relocation
-            if (child->relocation != NULL) {
-
-                NtWriteFile(hPathsFile, NULL, NULL, NULL, &IoStatusBlock, FlagStr, sizeof(WCHAR), NULL, NULL); // write |
-
-                WCHAR* RelocationEx = TranslatePath ? TranslatePath(child->relocation) : NULL;
-                NtWriteFile(hPathsFile, NULL, NULL, NULL, &IoStatusBlock, RelocationEx ? RelocationEx : child->relocation, wcslen(RelocationEx ? RelocationEx : child->relocation) * sizeof(WCHAR), NULL, NULL);
-                if (RelocationEx) Dll_Free(RelocationEx);
-            }
-
-            // write line ending
-            NtWriteFile(hPathsFile, NULL, NULL, NULL, &IoStatusBlock, (void*)CrLf, sizeof(CrLf) - sizeof(WCHAR), NULL, NULL);
-        }
+        if ((child->flags & ~SetFlags) != 0 || child->relocation != NULL) 
+            File_AppendPathEntry_internal(hPathsFile, Path, child->flags, child->relocation, TranslatePath);
 
         File_SavePathNode_internal(hPathsFile, &child->items, Path, Path_Len, SetFlags | child->flags, TranslatePath);
 
@@ -464,11 +473,35 @@ _FX VOID File_SavePathNode_internal(HANDLE hPathsFile, LIST* parent, WCHAR* Path
 
 
 //---------------------------------------------------------------------------
-// File_SavePathTree_internal
+// File_SeekToEndOfFile
 //---------------------------------------------------------------------------
 
 
-_FX VOID File_SavePathTree_internal(LIST* Root, const WCHAR* name, WCHAR* (*TranslatePath)(const WCHAR *))
+_FX BOOLEAN File_SeekToEndOfFile(HANDLE fileHandle) 
+{
+    NTSTATUS status;
+    IO_STATUS_BLOCK ioStatusBlock;
+    FILE_STANDARD_INFORMATION fileStandardInfo;
+
+    status = NtQueryInformationFile(fileHandle, &ioStatusBlock, &fileStandardInfo, sizeof(FILE_STANDARD_INFORMATION), FileStandardInformation);
+    if (NT_SUCCESS(status)) 
+    {
+        FILE_POSITION_INFORMATION filePosition;
+        filePosition.CurrentByteOffset = fileStandardInfo.EndOfFile;
+
+        status = NtSetInformationFile(fileHandle, &ioStatusBlock, &filePosition, sizeof(FILE_POSITION_INFORMATION), FilePositionInformation);
+    }
+
+    return NT_SUCCESS(status);
+}
+
+
+//---------------------------------------------------------------------------
+// File_OpenDataFile
+//---------------------------------------------------------------------------
+
+
+_FX BOOLEAN File_OpenDataFile(const WCHAR* name, HANDLE* hPathsFile, BOOLEAN Append)
 {
     WCHAR PathsFile[MAX_PATH] = { 0 };
     wcscpy(PathsFile, Dll_BoxFilePath);
@@ -481,9 +514,28 @@ _FX VOID File_SavePathTree_internal(LIST* Root, const WCHAR* name, WCHAR* (*Tran
     OBJECT_ATTRIBUTES objattrs;
     InitializeObjectAttributes(&objattrs, &objname, OBJ_CASE_INSENSITIVE, NULL, NULL);
 
-    HANDLE hPathsFile;
     IO_STATUS_BLOCK IoStatusBlock;
-    if (!NT_SUCCESS(NtCreateFile(&hPathsFile, GENERIC_WRITE | SYNCHRONIZE, &objattrs, &IoStatusBlock, NULL, 0, FILE_SHARE_READ, FILE_OVERWRITE_IF, FILE_SYNCHRONOUS_IO_NONALERT | FILE_NON_DIRECTORY_FILE, NULL, 0)))
+    if (!NT_SUCCESS(NtCreateFile(hPathsFile, GENERIC_WRITE | SYNCHRONIZE, &objattrs, &IoStatusBlock, NULL, 0, FILE_SHARE_READ, Append ? FILE_OPEN_IF : FILE_OVERWRITE_IF, FILE_SYNCHRONOUS_IO_NONALERT | FILE_NON_DIRECTORY_FILE, NULL, 0)))
+        return FALSE;
+
+    if (Append && !File_SeekToEndOfFile(*hPathsFile)) {
+        NtClose(*hPathsFile);
+        return FALSE;
+    }
+
+    return TRUE;
+}
+
+
+//---------------------------------------------------------------------------
+// File_SavePathTree_internal
+//---------------------------------------------------------------------------
+
+
+_FX VOID File_SavePathTree_internal(LIST* Root, const WCHAR* name, WCHAR* (*TranslatePath)(const WCHAR *))
+{
+    HANDLE hPathsFile;
+    if (!File_OpenDataFile(name, &hPathsFile, FALSE))
         return;
     
     WCHAR* Path = (WCHAR *)Dll_Alloc((0x7FFF + 1)*sizeof(WCHAR)); // max nt path
@@ -497,11 +549,11 @@ _FX VOID File_SavePathTree_internal(LIST* Root, const WCHAR* name, WCHAR* (*Tran
 
 
 //---------------------------------------------------------------------------
-// File_TranslateNtToDosPath2
+// File_TranslateNtToDosPathForDatFile
 //---------------------------------------------------------------------------
 
 
-_FX WCHAR* File_TranslateNtToDosPath2(const WCHAR *NtPath)
+_FX WCHAR* File_TranslateNtToDosPathForDatFile(const WCHAR *NtPath)
 {
     WCHAR *DosPath = NULL;
     ULONG len_nt;
@@ -583,7 +635,7 @@ _FX BOOLEAN File_SavePathTree()
 {
     EnterCriticalSection(File_PathRoot_CritSec);
 
-    File_SavePathTree_internal(&File_PathRoot, FILE_PATH_FILE_NAME, File_TranslateNtToDosPath2);
+    File_SavePathTree_internal(&File_PathRoot, FILE_PATH_FILE_NAME, File_TranslateNtToDosPathForDatFile);
 
     File_GetAttributes_internal(FILE_PATH_FILE_NAME, &File_PathsFileSize, &File_PathsFileDate, NULL);
 
@@ -712,14 +764,13 @@ _FX BOOLEAN File_LoadPathTree_internal(LIST* Root, const WCHAR* name, WCHAR* (*T
 
 
 //---------------------------------------------------------------------------
-// File_TranslateDosToNtPath2
+// File_TranslateDosToNtPathForDatFile
 //---------------------------------------------------------------------------
 
 
-_FX WCHAR *File_TranslateDosToNtPath2(const WCHAR *DosPath)
+_FX WCHAR *File_TranslateDosToNtPathForDatFile(const WCHAR *DosPath)
 {
     WCHAR *NtPath = NULL;
-    ULONG len_dos;
 
     if (DosPath && DosPath[0] && DosPath[1]) {
 
@@ -730,10 +781,7 @@ _FX WCHAR *File_TranslateDosToNtPath2(const WCHAR *DosPath)
             //
 
             DosPath += 2;
-            len_dos = wcslen(DosPath) + 1;
-            NtPath = Dll_Alloc((File_MupLen + len_dos) * sizeof(WCHAR));
-            wmemcpy(NtPath, File_Mup, File_MupLen);
-            wmemcpy(NtPath + File_MupLen, DosPath, len_dos);
+            NtPath = File_ConcatPath2(File_Mup, File_MupLen, DosPath, wcslen(DosPath));
 
         } else if (DosPath[0] != L'\\') {
 
@@ -763,10 +811,7 @@ _FX WCHAR *File_TranslateDosToNtPath2(const WCHAR *DosPath)
                     }
 
                     DosPath += path_pos;
-                    len_dos = wcslen(DosPath) + 1;
-                    NtPath = Dll_Alloc((drive->len + len_dos) * sizeof(WCHAR));
-                    wmemcpy(NtPath, drive->path, drive->len);
-                    wmemcpy(NtPath + drive->len, DosPath, len_dos);
+                    NtPath = File_ConcatPath2(drive->path, drive->len, DosPath, wcslen(DosPath));
 
                     LeaveCriticalSection(File_DrivesAndLinks_CritSec);
                 }
@@ -789,7 +834,7 @@ _FX BOOLEAN File_LoadPathTree()
 
     EnterCriticalSection(File_PathRoot_CritSec);
 
-    File_LoadPathTree_internal(&File_PathRoot, FILE_PATH_FILE_NAME, File_TranslateDosToNtPath2);
+    File_LoadPathTree_internal(&File_PathRoot, FILE_PATH_FILE_NAME, File_TranslateDosToNtPathForDatFile);
 
     LeaveCriticalSection(File_PathRoot_CritSec);
 
@@ -922,7 +967,7 @@ _FX BOOL File_TestBoxRootChange(ULONG WatchBit)
 //---------------------------------------------------------------------------
 
 
-_FX BOOLEAN File_MarkDeleted_internal(LIST* Root, const WCHAR* Path)
+_FX BOOLEAN File_MarkDeleted_internal(LIST* Root, const WCHAR* Path, BOOLEAN* pTruncated)
 {
     // 1. remove deleted branch
 
@@ -937,6 +982,7 @@ _FX BOOLEAN File_MarkDeleted_internal(LIST* Root, const WCHAR* Path)
         File_ClearPathBranche_internal(&Node->items);
         if (Node->relocation) Dll_Free(Node->relocation);
         Dll_Free(Node);
+        if (pTruncated) *pTruncated = TRUE;
     }
 
     // 2. set deleted flag
@@ -964,11 +1010,37 @@ _FX NTSTATUS File_MarkDeleted_v2(const WCHAR* TruePath)
 
     EnterCriticalSection(File_PathRoot_CritSec);
 
-    BOOLEAN bSet = File_MarkDeleted_internal(&File_PathRoot, File_NormalizePath(TruePath, NORM_NAME_BUFFER));
+    const WCHAR* Path = File_NormalizePath(TruePath, NORM_NAME_BUFFER);
+    BOOLEAN bTruncated = FALSE;
+    BOOLEAN bSet = File_MarkDeleted_internal(&File_PathRoot, Path, &bTruncated);
 
     LeaveCriticalSection(File_PathRoot_CritSec);
 
-    if (bSet) File_SavePathTree();
+    if (bSet)
+    {
+        //
+        // Optimization: When marking a lot of host files as deleted, only append single line entries if possible instead of re creating the entire file
+        //
+
+        ULONG64 PathsFileSize = 0;
+        ULONG64 PathsFileDate = 0;
+        if (!bTruncated 
+            && File_GetAttributes_internal(FILE_PATH_FILE_NAME, &PathsFileSize, &PathsFileDate, NULL)
+            && (File_PathsFileSize == PathsFileSize && File_PathsFileDate == PathsFileDate)) {
+
+            HANDLE hPathsFile;
+            if (File_OpenDataFile(FILE_PATH_FILE_NAME, &hPathsFile, TRUE))
+            {
+                File_AppendPathEntry_internal(hPathsFile, Path, FILE_DELETED_FLAG, NULL, File_TranslateNtToDosPathForDatFile);
+
+                NtClose(hPathsFile);
+
+                File_GetAttributes_internal(FILE_PATH_FILE_NAME, &File_PathsFileSize, &File_PathsFileDate, NULL);
+            }
+        }
+        else
+            File_SavePathTree();
+    }
 
     File_ReleaseMutex(hMutex);
 

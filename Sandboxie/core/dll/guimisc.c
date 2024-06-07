@@ -82,6 +82,14 @@ static void Gui_GetClipboardData_EnhMF(void *buf, ULONG sz, ULONG fmt);
 
 static BOOL Gui_EmptyClipboard();
 
+static int Gui_ShowCursor(BOOL bShow);
+
+static HWND Gui_SetActiveWindow(HWND hWnd);
+
+static BOOL  Gui_BringWindowToTop(HWND hWnd);
+
+static void Gui_SwitchToThisWindow(HWND hWnd, BOOL fAlt);
+
 static LONG Gui_ChangeDisplaySettingsExA(
     void *lpszDeviceName, void *lpDevMode, HWND hwnd,
     DWORD dwflags, void *lParam);
@@ -111,8 +119,7 @@ static int Gui_ReleaseDC(HWND hWnd, HDC hDc);
 
 static BOOL Gui_ShutdownBlockReasonCreate(HWND hWnd, LPCWSTR pwszReason);
 
-static EXECUTION_STATE Gui_SetThreadExecutionState(EXECUTION_STATE esFlags);
-
+static UINT_PTR Gui_SetTimer(HWND hWnd, UINT_PTR nIDEvent, UINT uElapse, TIMERPROC lpTimerFunc);
 
 //---------------------------------------------------------------------------
 
@@ -163,6 +170,8 @@ static ULONG Gui_OpenClipboard_seq  = -1;
 
 static HANDLE Gui_DummyInputDesktopHandle = NULL;
 
+       BOOLEAN Gui_BlockInterferenceControl = FALSE;
+
 
 //---------------------------------------------------------------------------
 // Gui_InitMisc
@@ -173,21 +182,28 @@ _FX BOOLEAN Gui_InitMisc(HMODULE module)
 {
     if (! Gui_OpenAllWinClasses) {
 
+        Gui_BlockInterferenceControl = SbieApi_QueryConfBool(NULL, L"BlockInterferenceControl", FALSE);
         
         SBIEDLL_HOOK_GUI(SetParent);
         if (Gui_UseProxyService) {
             SBIEDLL_HOOK_GUI(GetWindow);
             SBIEDLL_HOOK_GUI(GetParent);
-            SBIEDLL_HOOK_GUI(SetForegroundWindow);
+            
             SBIEDLL_HOOK_GUI(MonitorFromWindow);
         
             SBIEDLL_HOOK_GUI(SetCursor);
             SBIEDLL_HOOK_GUI(GetIconInfo);
-            SBIEDLL_HOOK_GUI(SetCursorPos);
-            SBIEDLL_HOOK_GUI(ClipCursor);
+            
         }
+		SBIEDLL_HOOK_GUI(SetCursorPos);
+		SBIEDLL_HOOK_GUI(SetForegroundWindow);
+		SBIEDLL_HOOK_GUI(ClipCursor);
         SBIEDLL_HOOK_GUI(SwapMouseButton);
         SBIEDLL_HOOK_GUI(SetDoubleClickTime);
+        SBIEDLL_HOOK_GUI(ShowCursor);
+        SBIEDLL_HOOK_GUI(BringWindowToTop);
+        SBIEDLL_HOOK_GUI(SwitchToThisWindow);
+        SBIEDLL_HOOK_GUI(SetActiveWindow);
 		
         if (Gui_UseBlockCapture) {
             SBIEDLL_HOOK_GUI(GetWindowDC);
@@ -273,12 +289,15 @@ _FX BOOLEAN Gui_InitMisc(HMODULE module)
     if (SbieApi_QueryConfBool(NULL, L"BlockInterferePower", FALSE)) {
 
         SBIEDLL_HOOK_GUI(ShutdownBlockReasonCreate);
-
-        module = Dll_Kernel32;
-
-        SBIEDLL_HOOK(Gui_, SetThreadExecutionState);
     }
-
+	
+	if (SbieApi_QueryConfBool(NULL, L"UseChangeSpeed", FALSE)) 	{
+		P_SetTimer SetTimer = Ldr_GetProcAddrNew(DllName_user32, "SetTimer", "SetTimer");
+        if (SetTimer) {
+            SBIEDLL_HOOK(Gui_, SetTimer);
+        }
+	}
+	
     return TRUE;
 }
 
@@ -350,6 +369,14 @@ _FX HWND Gui_SetParent(HWND hWndChild, HWND hWndNewParent)
 
 _FX BOOL Gui_ClipCursor(const RECT *lpRect)
 {
+	if (Gui_BlockInterferenceControl && lpRect) {
+		SetLastError(ERROR_ACCESS_DENIED);
+		return FALSE;
+	}
+	
+	if (!Gui_UseProxyService)
+		return __sys_ClipCursor(lpRect);
+	
     GUI_CLIP_CURSOR_REQ req;
     void *rpl;
 
@@ -506,6 +533,12 @@ _FX BOOL Gui_GetIconInfo(HICON hIcon, PICONINFO piconinfo)
 
 _FX BOOL Gui_SetCursorPos(int x, int y)
 {
+	if (Gui_BlockInterferenceControl)
+		return FALSE;
+	
+	if (!Gui_UseProxyService)
+		return __sys_SetCursorPos(x, y);
+		
     GUI_SET_CURSOR_POS_REQ req;
     GUI_SET_CURSOR_POS_RPL *rpl;
     ULONG error;
@@ -540,7 +573,12 @@ _FX BOOL Gui_SetForegroundWindow(HWND hWnd)
     GUI_SET_FOREGROUND_WINDOW_REQ req;
     void *rpl;
 
-    if (__sys_IsWindow(hWnd) || (! hWnd)) {
+	if (Gui_BlockInterferenceControl)	{
+		SetLastError(ERROR_ACCESS_DENIED);
+		return FALSE;
+	}
+	
+    if (!Gui_UseProxyService || __sys_IsWindow(hWnd) || (! hWnd)) {
         // window is in the same sandbox (or is NULL), no need for GUI Proxy
         return __sys_SetForegroundWindow(hWnd);
     }
@@ -1601,13 +1639,67 @@ _FX BOOL Gui_ShutdownBlockReasonCreate(HWND hWnd, LPCWSTR pwszReason)
 
 
 //---------------------------------------------------------------------------
-// Gui_SetThreadExecutionState
+// Gui_SetTimer
 //---------------------------------------------------------------------------
 
 
-_FX EXECUTION_STATE Gui_SetThreadExecutionState(EXECUTION_STATE esFlags) 
+_FX UINT_PTR Gui_SetTimer(HWND hWnd, UINT_PTR nIDEvent, UINT uElapse, TIMERPROC lpTimerFunc)
 {
-	SetLastError(ERROR_ACCESS_DENIED);
-	return 0;
-	//return __sys_SetThreadExecutionState(esFlags);
+	ULONG add = SbieApi_QueryConfNumber(NULL, L"AddTimerSpeed", 1), low = SbieApi_QueryConfNumber(NULL, L"LowTimerSpeed", 1);
+	if (add != 0 && low != 0)
+		return __sys_SetTimer(hWnd, nIDEvent, uElapse * add / low, lpTimerFunc);
+	else
+		return 0;
+}
+
+
+//---------------------------------------------------------------------------
+// Gui_ShowCursor
+//---------------------------------------------------------------------------
+
+
+_FX int Gui_ShowCursor(BOOL bShow) 
+{
+	if (Gui_BlockInterferenceControl && !bShow)
+		return 0;
+	return __sys_ShowCursor(bShow);
+}
+
+
+//---------------------------------------------------------------------------
+// Gui_SetActiveWindow
+//---------------------------------------------------------------------------
+
+
+_FX HWND Gui_SetActiveWindow(HWND hWnd) 
+{
+	if (Gui_BlockInterferenceControl)
+		return NULL;
+	return __sys_SetActiveWindow(hWnd);
+}
+
+
+//---------------------------------------------------------------------------
+// Gui_BringWindowToTop
+//---------------------------------------------------------------------------
+
+
+_FX BOOL  Gui_BringWindowToTop(HWND hWnd) 
+{
+	if (Gui_BlockInterferenceControl)
+		return FALSE;
+	return __sys_BringWindowToTop(hWnd);
+}
+
+
+//---------------------------------------------------------------------------
+// Gui_SwitchToThisWindow
+//---------------------------------------------------------------------------
+
+
+_FX void Gui_SwitchToThisWindow(HWND hWnd, BOOL fAlt) 
+{
+	if (Gui_BlockInterferenceControl)
+		return;
+	__sys_SwitchToThisWindow(hWnd, fAlt);
 }
